@@ -55,7 +55,12 @@ def parse_open_interest_rows(
     rows: list[dict[str, Any]],
     *,
     requested_symbol: str | None = None,
+    label_offset: pd.Timedelta = pd.Timedelta(0),
 ) -> pd.DataFrame:
+    """openInterestHist rows; ``label_offset`` is added to each timestamp.
+
+    The 5m collector passes ``-5min`` so the point at close C is labeled C-5m.
+    """
     if not rows:
         return pd.DataFrame(columns=OPEN_INTEREST_COLUMNS)
     records = []
@@ -63,7 +68,8 @@ def parse_open_interest_rows(
         symbol = row.get("symbol") or requested_symbol
         records.append(
             {
-                "open_time": pd.to_datetime(row.get("timestamp"), unit="ms", utc=True),
+                "open_time": pd.to_datetime(row.get("timestamp"), unit="ms", utc=True)
+                + label_offset,
                 "symbol": symbol,
                 "open_interest": row.get("sumOpenInterest"),
                 "open_interest_value": row.get("sumOpenInterestValue"),

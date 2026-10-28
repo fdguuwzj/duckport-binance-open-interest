@@ -133,6 +133,49 @@ class DuckportClient:
             reader = self.client.do_get(ticket)
         return reader.read_all()
 
+    def query(self, sql: str) -> pa.Table | None:
+        """Run a read query; ``None`` when it returns no rows."""
+        ticket = flight.Ticket(json.dumps({"type": "duckport.query", "sql": sql}).encode())
+        try:
+            try:
+                reader = self.client.do_get(ticket)
+            except flight.FlightUnavailableError:
+                self._reconnect()
+                reader = self.client.do_get(ticket)
+            return reader.read_all()
+        except flight.FlightInternalError as exc:
+            # duckport sends no data message for an empty result.
+            if "never sent a data message" in str(exc):
+                return None
+            raise
+
+    def missing_labels(
+        self,
+        symbols: list[str],
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """``(symbol, open_time)`` pairs on the 5m grid in [start, end] with no row."""
+        if not symbols:
+            return pd.DataFrame(columns=["symbol", "open_time"])
+        fmt = "%Y-%m-%d %H:%M:%S"
+        lo = pd.to_datetime(start, utc=True).strftime(fmt)
+        hi = pd.to_datetime(end, utc=True).strftime(fmt)
+        values = ", ".join(f"({self._sql_str(symbol)})" for symbol in symbols)
+        table = self.query(
+            f"WITH s(symbol) AS (VALUES {values}), "
+            f"g AS (SELECT generate_series AS open_time FROM generate_series("
+            f"TIMESTAMP '{lo}', TIMESTAMP '{hi}', INTERVAL 5 MINUTE)) "
+            f"SELECT s.symbol, g.open_time FROM s CROSS JOIN g "
+            f"WHERE NOT EXISTS (SELECT 1 FROM {self.schema}.{self._table()} t "
+            f"WHERE t.symbol = s.symbol AND t.open_time = g.open_time)"
+        )
+        if table is None or table.num_rows == 0:
+            return pd.DataFrame(columns=["symbol", "open_time"])
+        frame = table.to_pandas()
+        frame["open_time"] = pd.to_datetime(frame["open_time"], utc=True)
+        return frame
+
     def _table(self) -> str:
         return getattr(self, "table", OPEN_INTEREST_TABLE)
 
@@ -184,33 +227,42 @@ class DuckportClient:
     def write_open_interest(
         self,
         frame: pd.DataFrame,
-        complete_through: pd.Timestamp,
+        complete_through: pd.Timestamp | None,
         *,
         time_floor: str | None = None,
     ) -> dict:
+        """Insert rows; with ``complete_through`` also move the watermark atomically.
+
+        ``None`` leaves the watermark alone (history repair behind it).
+        """
+        timestamp = (
+            None
+            if complete_through is None
+            else pd.to_datetime(complete_through, utc=True).strftime("%Y-%m-%d %H:%M:%S")
+        )
         if frame.empty:
-            self.replace_duck_time(complete_through)
+            if complete_through is not None:
+                self.replace_duck_time(complete_through)
             return {"total_rows": 0}
         floor = self._time_floor() if time_floor is None else time_floor
         arrow = self._open_interest_arrow(frame[OPEN_INTEREST_COLUMNS], time_floor=floor)
         table = self._table()
         staging = f"_staging_{table}"
         target = f"{self.schema}.{table}"
-        timestamp = pd.to_datetime(complete_through, utc=True).strftime("%Y-%m-%d %H:%M:%S")
+        statements = [
+            f"INSERT INTO {target} SELECT * FROM {staging} "
+            f"ON CONFLICT (open_time, symbol) DO NOTHING",
+        ]
+        if timestamp is not None:
+            statements.append(self._watermark_sql(timestamp))
+        statements.append(f"TRUNCATE {staging}")
         with self._write_lock:
             self.execute(f"TRUNCATE {staging}")
             append_response = self.append("main", staging, arrow)
-            response = self.execute_transaction(
-                [
-                    f"INSERT INTO {target} SELECT * FROM {staging} "
-                    f"ON CONFLICT (open_time, symbol) DO NOTHING",
-                    self._watermark_sql(timestamp),
-                    f"TRUNCATE {staging}",
-                ]
-            )
+            response = self.execute_transaction(statements)
         logger.info(
             f"OI write complete: staged={append_response.get('rows_appended', len(arrow))}, "
-            f"through={timestamp}"
+            f"through={timestamp or 'unchanged'}"
         )
         return response
 

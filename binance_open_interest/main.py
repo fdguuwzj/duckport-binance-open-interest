@@ -20,10 +20,10 @@ def main() -> None:
 
         snapshot_main()
         return
-    if OI_MODE != "history":
-        logger.error(f"Unknown OI_MODE={OI_MODE!r}; expected history or snapshot")
+    if OI_MODE not in ("5m", "history"):
+        logger.error(f"Unknown OI_MODE={OI_MODE!r}; expected 5m or snapshot")
         sys.exit(1)
-    logger.info("Binance 5m open-interest ingestor starting")
+    logger.info("Binance 5m open-interest ingestor starting (K-line labels: T = OI at T+5m)")
     client = DuckportClient(addr=DUCKPORT_ADDR, schema=DUCKPORT_SCHEMA)
 
     def shutdown(signum, frame):

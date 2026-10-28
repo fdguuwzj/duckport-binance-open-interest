@@ -17,22 +17,18 @@ import threading
 import aiohttp
 import pandas as pd
 
-from binance_open_interest.api import BinanceApiError, BinanceOpenInterestRestApi
+from binance_open_interest.api import BinanceOpenInterestRestApi
 from binance_open_interest.config import (
     DUCKPORT_ADDR,
     DUCKPORT_SCHEMA,
     HTTP_TIMEOUT_SECONDS,
     OPEN_INTEREST_1M_TABLE,
-    RETRY_BASE_SECONDS,
-    SNAPSHOT_CONCURRENCY,
     SNAPSHOT_DELAY_SECONDS,
-    SNAPSHOT_RETRY_TIMES,
     SNAPSHOT_RPS,
 )
-from binance_open_interest.data_jobs import OpenInterestFetcher, RequestPacer
 from binance_open_interest.duckport_client import DuckportClient
+from binance_open_interest.fetch import SnapshotFetcher
 from binance_open_interest.log import logger
-from binance_open_interest.model import build_snapshot_frame
 
 
 def utc_timestamp(value) -> pd.Timestamp:
@@ -58,87 +54,7 @@ def plan_snapshot(now, duck_time, delay_seconds: int = SNAPSHOT_DELAY_SECONDS):
     return ("capture", bar)
 
 
-class OpenInterestSnapshotFetcher:
-    def __init__(
-        self,
-        api: BinanceOpenInterestRestApi,
-        *,
-        concurrency: int = SNAPSHOT_CONCURRENCY,
-        rps: float = SNAPSHOT_RPS,
-        retry_times: int = SNAPSHOT_RETRY_TIMES,
-    ):
-        self.api = api
-        self.retry_times = retry_times
-        self._semaphore = asyncio.Semaphore(concurrency)
-        self._pacer = RequestPacer(1.0 / rps)
-
-    async def trading_symbols(self) -> list[str]:
-        return await OpenInterestFetcher(self.api).trading_symbols()
-
-    async def mark_prices(self) -> dict[str, str]:
-        payload = await self.api.premium_index()
-        prices = {}
-        for item in payload:
-            symbol = item.get("symbol")
-            mark = item.get("markPrice")
-            if symbol and mark not in (None, ""):
-                prices[symbol] = str(mark)
-        return prices
-
-    async def _open_interest(self, symbol: str) -> dict:
-        last_error = None
-        for attempt in range(self.retry_times + 1):
-            try:
-                async with self._semaphore:
-                    await self._pacer.wait()
-                    return await self.api.open_interest(symbol)
-            except Exception as exc:
-                last_error = exc
-                if attempt >= self.retry_times:
-                    break
-                delay = min(10.0, RETRY_BASE_SECONDS * (2**attempt))
-                if isinstance(exc, BinanceApiError) and exc.retry_after:
-                    try:
-                        delay = max(delay, float(exc.retry_after))
-                    except ValueError:
-                        pass
-                if isinstance(exc, BinanceApiError) and exc.status in (418, 429):
-                    await self._pacer.defer(delay)
-                await asyncio.sleep(delay)
-        raise RuntimeError(f"OI snapshot failed for {symbol}") from last_error
-
-    async def fetch_once(
-        self,
-        symbols: list[str],
-        open_time: pd.Timestamp,
-        mark_prices: dict[str, str],
-    ) -> tuple[pd.DataFrame, list[str]]:
-        async def fetch_one(symbol: str):
-            try:
-                payload = await self._open_interest(symbol)
-            except Exception as exc:
-                return symbol, exc
-            return symbol, payload
-
-        results = await asyncio.gather(*(fetch_one(symbol) for symbol in symbols))
-        rows = []
-        failed = []
-        for symbol, payload in results:
-            if isinstance(payload, Exception):
-                failed.append(symbol)
-                continue
-            mark = mark_prices.get(symbol) or mark_prices.get(payload.get("symbol"))
-            if mark is None or payload.get("openInterest") in (None, ""):
-                failed.append(symbol)
-                continue
-            rows.append(
-                {
-                    "symbol": payload.get("symbol") or symbol,
-                    "open_interest": payload.get("openInterest"),
-                    "mark_price": mark,
-                }
-            )
-        return build_snapshot_frame(open_time, rows), failed
+OpenInterestSnapshotFetcher = SnapshotFetcher
 
 
 class OpenInterestSnapshotJobs:
@@ -177,7 +93,10 @@ class OpenInterestSnapshotJobs:
             fetcher = OpenInterestSnapshotFetcher(BinanceOpenInterestRestApi(session))
             symbols = await fetcher.trading_symbols()
             if not symbols:
-                raise RuntimeError("Binance exchangeInfo returned no trading USDT perpetual symbols")
+                raise RuntimeError(
+                    "Binance exchangeInfo returned no trading USDT perpetual "
+                    "or TradFi perpetual symbols"
+                )
             estimated = len(symbols) / SNAPSHOT_RPS
             if estimated > 40:
                 logger.warning(
