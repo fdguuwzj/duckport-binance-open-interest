@@ -72,6 +72,20 @@ class ModelTests(unittest.TestCase):
         self.assertIsNone(frame.iloc[0]["cmc_circulating_supply"])
         self.assertEqual(frame.iloc[0]["open_time"], pd.Timestamp("2026-01-01 10:31:00", tz="UTC"))
 
+    def test_snapshot_frame_notional_above_1e10(self):
+        # BTCUSDT peaked near 1.28e10 USDT on 2025-10-05. 11 integer digits + 18 decimals exceed the
+        # default 28-digit decimal context; one such symbol used to fail the whole sweep.
+        frame = build_snapshot_frame(
+            pd.Timestamp("2025-10-05 12:00:01", tz="UTC"),
+            [
+                {"symbol": "BTCUSDT", "open_interest": "103512.123", "mark_price": "123456.12345678"},
+                {"symbol": "ETHUSDT", "open_interest": "2382399.455", "mark_price": "2326.67"},
+            ],
+        )
+        self.assertEqual(list(frame["symbol"]), ["BTCUSDT", "ETHUSDT"])
+        self.assertEqual(frame.iloc[0]["open_interest_value"], Decimal("12779205436.361396543940000000"))
+        self.assertEqual(frame.iloc[1]["open_interest_value"], Decimal("5543057339.96485"))
+
 
 if __name__ == "__main__":
     unittest.main()

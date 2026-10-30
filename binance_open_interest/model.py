@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+from decimal import Context, Decimal, InvalidOperation
 from typing import Any
 
 import pandas as pd
+
+# DECIMAL(38,18) holds up to 38 digits; the default 28-digit context cannot quantize a notional of
+# 1e10 or more to 18 decimals (BTCUSDT passed 1e10 on 82 days in 2024-2025).
+_VALUE_CONTEXT = Context(prec=60)
 
 
 OPEN_INTEREST_COLUMNS = [
@@ -106,7 +110,9 @@ def build_snapshot_frame(open_time, rows: list[dict[str, Any]]) -> pd.DataFrame:
                 "open_time": open_time,
                 "symbol": symbol,
                 "open_interest": open_interest,
-                "open_interest_value": (open_interest * mark_price).quantize(value_quantum),
+                "open_interest_value": _VALUE_CONTEXT.multiply(open_interest, mark_price).quantize(
+                    value_quantum, context=_VALUE_CONTEXT
+                ),
                 "cmc_circulating_supply": None,
             }
         )
